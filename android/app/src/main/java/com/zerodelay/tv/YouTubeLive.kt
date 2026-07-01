@@ -22,7 +22,9 @@ data class HlsResult(val url: String?, val diagnostic: String? = null)
  */
 object YouTubeLive {
 
-    private const val UA =
+    // Public so the player can send the SAME browser UA when fetching manifests
+    // and segments: googlevideo returns 403 for non-browser user agents.
+    const val UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/120 Safari/537.36"
     private const val CHANNEL = "@CazeTV"

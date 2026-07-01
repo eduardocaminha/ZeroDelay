@@ -16,7 +16,9 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -107,7 +109,14 @@ class PlayerActivity : Activity() {
     // --- Playback -----------------------------------------------------------
 
     private fun setupPlayer() {
-        val p = ExoPlayer.Builder(this).build()
+        // googlevideo 403s non-browser user agents, so fetch manifests/segments
+        // with the same browser UA used during extraction.
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(YouTubeLive.UA)
+            .setAllowCrossProtocolRedirects(true)
+        val p = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(httpFactory))
+            .build()
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 errorCount++
