@@ -14,6 +14,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -54,6 +55,11 @@ class PlayerActivity : Activity() {
     private var hlsUrl: String? = null
     private var modeIndex = Modes.DEFAULT_INDEX
     private var reExtracting = false
+
+    // Diagnostics surfaced in the overlay (temporary, to chase a black-screen).
+    private var videoW = 0
+    private var videoH = 0
+    private var firstFrame = false
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -102,6 +108,13 @@ class PlayerActivity : Activity() {
         val p = ExoPlayer.Builder(this).build()
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) = onPlaybackError()
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                videoW = videoSize.width
+                videoH = videoSize.height
+            }
+            override fun onRenderedFirstFrame() {
+                firstFrame = true
+            }
         })
         playerView.player = p
         playerView.useController = false
@@ -198,7 +211,15 @@ class PlayerActivity : Activity() {
         val latency = if (off == C.TIME_UNSET) "--" else String.format("%.1fs", off / 1000.0)
         val buffered = p.totalBufferedDuration / 1000.0
         val speed = p.playbackParameters.speed
-        info.text = getString(R.string.info_fmt, latency, buffered, speed)
+        val state = when (p.playbackState) {
+            Player.STATE_IDLE -> "idle"
+            Player.STATE_BUFFERING -> "buffering"
+            Player.STATE_READY -> "ready"
+            Player.STATE_ENDED -> "ended"
+            else -> "?"
+        }
+        val diag = "estado=$state play=${p.isPlaying} vídeo=${videoW}x$videoH frame=${if (firstFrame) "sim" else "não"}"
+        info.text = getString(R.string.info_fmt, latency, buffered, speed) + "\n" + diag
     }
 
     // --- Overlay / D-pad ----------------------------------------------------
