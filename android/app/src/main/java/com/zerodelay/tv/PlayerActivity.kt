@@ -7,23 +7,26 @@ import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
 import android.view.View
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.TextView
 import org.json.JSONObject
 
 /**
- * Plays a live via the YouTube IFrame player inside a WebView. The embedded
- * player is the real YouTube player, so it carries the PoToken that direct HLS
- * extraction can't (googlevideo 403s naked segment requests; see
- * android/spike/FINDINGS.md). The ZeroDelay catch-up runs as injected JS: it
- * speeds up toward the mode's target latency and skips to the live edge.
+ * Plays a live by loading the real YouTube watch page in a WebView and injecting
+ * the ZeroDelay catch-up engine (a port of engine/controller.js + inject.js).
  *
- * Decisive unknown this build answers: whether the IFrame API allows a playback
- * rate > 1 on a LIVE stream. The overlay shows `avail=[...]` (the rates YouTube
- * offers). If it is only [1], embed catch-up is impossible and we pivot to
- * injecting into the full watch page instead.
+ * Why the watch page and not an embed: CazéTV disables third-party embedding
+ * (IFrame error 152), and direct HLS extraction is PoToken-gated (segment 403,
+ * see android/spike/FINDINGS.md). The real watch page is the only context that
+ * both plays (it mints its own PoToken) and exposes the private player API
+ * (getStatsForNerds / setPlaybackRate / seekToLiveHead) the engine needs.
+ *
+ * A desktop User-Agent gets the full desktop player; a consent cookie avoids the
+ * interstitial. Risk: YouTube may still gate a WebView with a bot check / sign-in.
  */
 class PlayerActivity : Activity() {
 
@@ -31,6 +34,8 @@ class PlayerActivity : Activity() {
         const val EXTRA_VIDEO_ID = "videoId"
         const val EXTRA_TITLE = "title"
         private const val OVERLAY_TIMEOUT_MS = 6000L
+        private const val DESKTOP_UA =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -42,6 +47,7 @@ class PlayerActivity : Activity() {
 
     private var videoId: String = ""
     private var modeIndex = Modes.DEFAULT_INDEX
+    private var injected = false
 
     private val hideOverlay = Runnable { overlay.visibility = View.GONE }
 
@@ -63,12 +69,24 @@ class PlayerActivity : Activity() {
         web.settings.javaScriptEnabled = true
         web.settings.domStorageEnabled = true
         web.settings.mediaPlaybackRequiresUserGesture = false
+        web.settings.userAgentString = DESKTOP_UA
         web.addJavascriptInterface(Bridge(), "Android")
+
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setCookie("https://www.youtube.com", "SOCS=CAI")
+
+        web.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                inject()
+                // Re-inject once after the SPA settles, in case the player wasn't
+                // in the DOM at page-finished. The engine guards double-install.
+                ui.postDelayed({ inject() }, 4000)
+            }
+        }
 
         info.text = getString(R.string.loading)
         overlay.visibility = View.VISIBLE
-        // Base URL youtube.com so the IFrame API's postMessage origin checks pass.
-        web.loadDataWithBaseURL("https://www.youtube.com", buildHtml(videoId), "text/html", "utf-8", null)
+        web.loadUrl("https://www.youtube.com/watch?v=$videoId")
     }
 
     override fun onStop() {
@@ -82,6 +100,12 @@ class PlayerActivity : Activity() {
         super.onDestroy()
     }
 
+    private fun inject() {
+        web.evaluateJavascript(ENGINE_JS, null)
+        injected = true
+        applyMode()
+    }
+
     // --- JS bridge ----------------------------------------------------------
 
     inner class Bridge {
@@ -93,18 +117,15 @@ class PlayerActivity : Activity() {
 
     private fun showStats(json: String) {
         val s = runCatching { JSONObject(json) }.getOrNull() ?: return
+        val isLive = s.optBoolean("isLive", false)
         val lat = s.optDouble("lat", Double.NaN)
+        val health = s.optDouble("health", Double.NaN)
         val rate = s.optDouble("rate", 1.0)
-        val ps = s.optInt("ps", -99)
-        val avail = s.optString("avail", "?")
-        val err = s.optInt("err", 0)
+        val err = s.optString("err", "")
         val latStr = if (lat.isNaN()) "--" else String.format("%.1fs", lat)
-        val stateStr = when (ps) {
-            -1 -> "unstarted"; 0 -> "ended"; 1 -> "playing"; 2 -> "paused"
-            3 -> "buffering"; 5 -> "cued"; else -> "?"
-        }
-        val line1 = "Latência: $latStr  ·  Velocidade: ${String.format("%.2f", rate)}x"
-        val line2 = "estado=$stateStr avail=$avail" + if (err != 0) " ERRO=$err" else ""
+        val hStr = if (health.isNaN()) "--" else String.format("%.1fs", health)
+        val line1 = "Latência: $latStr  ·  Buffer: $hStr  ·  Velocidade: ${String.format("%.2f", rate)}x"
+        val line2 = "live=$isLive" + if (err.isNotEmpty()) "  err=$err" else ""
         info.text = "$line1\n$line2"
     }
 
@@ -122,18 +143,18 @@ class PlayerActivity : Activity() {
     }
 
     private fun applyMode() {
+        if (!injected) return
         val m = Modes.LIST[modeIndex]
-        val target = m.targetOffsetMs / 1000.0
-        val skipAt = m.skipThresholdMs / 1000.0
-        js("window.zd && window.zd.setMode($target, ${m.maxSpeed}, ${m.skip}, $skipAt)")
+        web.evaluateJavascript(
+            "window.zd&&window.zd.setMode(${m.enabled},${m.auto},${m.bufferTarget},${m.speed},${m.skip},${m.skipThresholdSec})",
+            null,
+        )
     }
 
     private fun goLive() {
-        js("window.zd && window.zd.goLive()")
+        web.evaluateJavascript("window.zd&&window.zd.goLive()", null)
         scheduleOverlayHide()
     }
-
-    private fun js(code: String) = web.evaluateJavascript(code, null)
 
     // --- Overlay / D-pad ----------------------------------------------------
 
@@ -168,65 +189,50 @@ class PlayerActivity : Activity() {
         }
         return super.dispatchKeyEvent(event)
     }
-
-    // --- Embedded page ------------------------------------------------------
-
-    // Default mode baked in matches Modes.DEFAULT_INDEX (Automático): target 6s,
-    // max rate 1.25, skip at 30s. Kotlin re-sends on mode change.
-    private fun buildHtml(vid: String): String = HTML_TEMPLATE.replace("__VID__", vid)
 }
 
-private const val HTML_TEMPLATE = """
-<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}</style>
-</head><body>
-<div id="p"></div>
-<script>
-var VIDEO_ID="__VID__";
-var player, ready=false;
-var mode={target:6, maxRate:1.25, skip:true, skipAt:30};
-var st={rate:1, cur:0, dur:0, lat:null, ps:-1, avail:"?", err:0};
-function onYouTubeIframeAPIReady(){
-  player=new YT.Player('p',{
-    videoId:VIDEO_ID,
-    playerVars:{autoplay:1, controls:0, rel:0, playsinline:1, modestbranding:1, fs:0},
-    events:{
-      onReady:function(){
-        ready=true;
-        try{player.playVideo();}catch(e){}
-        try{st.avail=JSON.stringify(player.getAvailablePlaybackRates());}catch(e){}
-        loop();
-      },
-      onStateChange:function(e){st.ps=e.data;},
-      onError:function(e){st.err=e.data;}
-    }
-  });
-}
-function loop(){
-  try{
-    st.cur=player.getCurrentTime();
-    st.dur=player.getDuration();
-    st.rate=player.getPlaybackRate();
-    st.lat=Math.max(0, st.dur-st.cur);
-    if(mode.skip && st.lat>mode.skipAt){
-      player.seekTo(st.dur, true);
-    } else if(st.lat > mode.target+1.5){
-      if(Math.abs(st.rate-mode.maxRate)>0.01) player.setPlaybackRate(mode.maxRate);
-    } else if(st.lat <= mode.target){
-      if(Math.abs(st.rate-1)>0.01) player.setPlaybackRate(1);
-    }
-  }catch(e){}
-  try{Android.onStats(JSON.stringify(st));}catch(e){}
-  setTimeout(loop, 500);
-}
-window.zd={
-  setMode:function(t,m,skip,skipAt){mode={target:t, maxRate:m, skip:skip, skipAt:skipAt};},
-  goLive:function(){try{player.seekTo(player.getDuration(), true);}catch(e){}}
-};
-var s=document.createElement('script');
-s.src="https://www.youtube.com/iframe_api";
-document.head.appendChild(s);
-</script>
-</body></html>
+// Injected catch-up engine: a faithful port of engine/controller.js (EMA +
+// hysteresis) and the inject.js loop, driving the real watch-page player.
+private const val ENGINE_JS = """
+(function(){
+  if(window.__zd_installed) return; window.__zd_installed=true;
+  var BUFFER_FLOOR=1.5,BUFFER_BACKOFF=2.5,BUFFER_RESUME=4.0,CATCH_UP_BAND=1.5,MIN_LATENCY=2.0;
+  var buffer_headroom_ok=true,buffer_ema=null,catching_up=false,auto_target=6.0,auto_cooldown=0;
+  var applied_rate=1.0,yielded=false;
+  var mode={enabled:true,auto:true,bufferTarget:6.0,speed:1.25,skip:true,skipAt:30.0};
+  var st={isLive:false,lat:null,health:null,rate:1.0,err:''};
+  function accel_ok(h){ if(!isFinite(h))return false; if(h<=BUFFER_BACKOFF)buffer_headroom_ok=false; else if(h>=BUFFER_RESUME)buffer_headroom_ok=true; return buffer_headroom_ok; }
+  function auto_buf(h){ if(isFinite(h)&&h<1.0){auto_target=Math.min(9.0,auto_target+1.0);auto_cooldown=240;} else if(auto_cooldown>0){auto_cooldown--;} else if(buffer_ema!==null&&buffer_ema>auto_target+2.0){auto_target=Math.max(4.0,auto_target-0.01);} return auto_target; }
+  function calcRate(speed,lat,h,target,auto){ if(!isFinite(h)||!isFinite(lat))return 1.0; buffer_ema=(buffer_ema===null)?h:(buffer_ema*0.9+h*0.1); if(lat<MIN_LATENCY)return 1.0; var t=auto?auto_buf(h):target; if(buffer_ema>t+CATCH_UP_BAND)catching_up=true; else if(buffer_ema<=t)catching_up=false; if(!catching_up)return 1.0; if(h<BUFFER_FLOOR||!accel_ok(h))return 1.0; return speed; }
+  function P(){ return document.getElementById('movie_player'); }
+  function applyRate(pl,desired){ if(!pl.setPlaybackRate||!pl.getPlaybackRate)return; var cur=pl.getPlaybackRate(); if(Math.abs(cur-applied_rate)>0.01){ if(Math.abs(cur-1.0)<0.01){applied_rate=1.0;yielded=false;} else {yielded=true;applied_rate=cur;} } if(yielded)return; if(Math.abs(desired-applied_rate)>0.01){pl.setPlaybackRate(desired);applied_rate=desired;} }
+  var kicked=false;
+  function tick(){
+    try{
+      var pl=P();
+      if(pl){
+        if(!kicked&&pl.playVideo){ pl.playVideo(); kicked=true; }
+        if(pl.getStatsForNerds){
+          var s=pl.getStatsForNerds();
+          if(s&&s.live_latency_style===''){
+            var lat=parseFloat(s.live_latency_secs), h=parseFloat(s.buffer_health_seconds);
+            st.isLive=true; st.lat=lat; st.health=h; st.err='';
+            var ps=pl.getPlayerStateObject?pl.getPlayerStateObject():null;
+            if(mode.enabled){ applyRate(pl, calcRate(mode.speed,lat,h, mode.auto?0:mode.bufferTarget, mode.auto)); }
+            else { applyRate(pl,1.0); }
+            if(mode.skip&&pl.seekToLiveHead&&isFinite(lat)&&lat>=mode.skipAt){ if(!ps||ps.isPlaying){ pl.seekToLiveHead(); if(pl.playVideo)pl.playVideo(); } }
+            if(pl.getPlaybackRate) st.rate=pl.getPlaybackRate();
+          } else { st.isLive=false; }
+        }
+      }
+    }catch(e){ st.err=(''+e).slice(0,70); }
+    try{ Android.onStats(JSON.stringify(st)); }catch(e){}
+    setTimeout(tick,250);
+  }
+  window.zd={
+    setMode:function(en,auto,bt,sp,skip,skipAt){ mode={enabled:en,auto:auto,bufferTarget:bt,speed:sp,skip:skip,skipAt:skipAt}; },
+    goLive:function(){ try{ var pl=P(); if(pl&&pl.seekToLiveHead){ pl.seekToLiveHead(); if(pl.playVideo)pl.playVideo(); } }catch(e){} }
+  };
+  tick();
+})();
 """

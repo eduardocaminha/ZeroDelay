@@ -1,46 +1,30 @@
 package com.zerodelay.tv
 
-import androidx.annotation.OptIn
-import androidx.media3.common.MediaItem
-import androidx.media3.common.util.UnstableApi
-
 /**
- * One catch-up mode. Hybrid engine: ExoPlayer's LiveConfiguration does the
- * smooth speed catch-up toward `targetOffsetMs` (how far behind the live edge we
- * aim to play; smaller = closer to live = needs a better connection), bounded by
- * the speed band. The ported ZeroDelay layer adds skip-to-live on top (see
- * PlayerActivity). Mirrors the extension's presets in common.js.
+ * Catch-up mode, mirroring the ZeroDelay extension presets (common.js). Fed to
+ * the injected engine, which is a port of engine/controller.js: it speeds up
+ * (up to `speed`) while the smoothed buffer sits above `bufferTarget`, rests at
+ * 1.0x otherwise, and `auto` lets the engine adapt the target to the connection.
  */
 data class Mode(
     val id: String,
     val labelRes: Int,
-    val targetOffsetMs: Long, // 0 = don't override the stream's own live offset
-    val minSpeed: Float,
-    val maxSpeed: Float,
+    val enabled: Boolean,
+    val auto: Boolean,
+    val bufferTarget: Double,
+    val speed: Double,
     val skip: Boolean,
-    val skipThresholdMs: Long = 30_000L,
-) {
-    @OptIn(UnstableApi::class)
-    fun liveConfig(): MediaItem.LiveConfiguration? {
-        if (targetOffsetMs <= 0L && minSpeed == 1f && maxSpeed == 1f) return null
-        return MediaItem.LiveConfiguration.Builder().apply {
-            if (targetOffsetMs > 0L) setTargetOffsetMs(targetOffsetMs)
-            setMinPlaybackSpeed(minSpeed)
-            setMaxPlaybackSpeed(maxSpeed)
-        }.build()
-    }
-}
+    val skipThresholdSec: Double,
+)
 
 object Modes {
-    // Same order/identity as the ZeroDelay extension. Index 1 (Automático) is
-    // the default. Off = plain playback, no catch-up, no skip.
     val LIST: List<Mode> = listOf(
-        Mode("off", R.string.mode_off, 0L, 1f, 1f, skip = false),
-        Mode("auto", R.string.mode_auto, 6000L, 0.94f, 1.25f, skip = true),
-        Mode("suave", R.string.mode_suave, 8000L, 0.97f, 1.10f, skip = true),
-        Mode("balanced", R.string.mode_balanced, 6000L, 0.96f, 1.25f, skip = true),
-        Mode("aggressive", R.string.mode_aggressive, 4500L, 0.95f, 1.40f, skip = true),
-        Mode("min", R.string.mode_min, 3500L, 0.94f, 1.50f, skip = true),
+        Mode("off", R.string.mode_off, enabled = false, auto = false, bufferTarget = 6.0, speed = 1.25, skip = false, skipThresholdSec = 30.0),
+        Mode("auto", R.string.mode_auto, enabled = true, auto = true, bufferTarget = 6.0, speed = 1.25, skip = true, skipThresholdSec = 30.0),
+        Mode("suave", R.string.mode_suave, enabled = true, auto = false, bufferTarget = 8.0, speed = 1.25, skip = true, skipThresholdSec = 30.0),
+        Mode("balanced", R.string.mode_balanced, enabled = true, auto = false, bufferTarget = 6.0, speed = 1.25, skip = true, skipThresholdSec = 30.0),
+        Mode("aggressive", R.string.mode_aggressive, enabled = true, auto = false, bufferTarget = 4.5, speed = 1.25, skip = true, skipThresholdSec = 30.0),
+        Mode("min", R.string.mode_min, enabled = true, auto = false, bufferTarget = 3.5, speed = 1.25, skip = true, skipThresholdSec = 30.0),
     )
 
     const val DEFAULT_INDEX = 1 // Automático
