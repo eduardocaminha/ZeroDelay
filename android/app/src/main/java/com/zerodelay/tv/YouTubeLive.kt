@@ -35,8 +35,13 @@ object YouTubeLive {
     // --- Public API ---------------------------------------------------------
 
     /**
-     * CazéTV FIFA World Cup matches currently AO VIVO (live now), in the order
-     * YouTube lists them. Non-World-Cup lives are filtered out.
+     * CazéTV FIFA World Cup matches that are LIVE right now, in the order YouTube
+     * lists them. Scheduled/upcoming matches are excluded: CazéTV creates a live
+     * with the "AO VIVO: ..." title hours ahead (waiting room, no HLS yet), so
+     * liveness must come from the thumbnail badge, not the title text. A live
+     * lockup carries a standalone "AO VIVO" badge; a scheduled one carries
+     * "Em breve" instead. The real match title is the string with the World Cup
+     * tag (using the first "AO VIVO"-prefixed string would grab the bare badge).
      */
     fun listLiveGames(): List<Game> {
         val html = httpGet("https://www.youtube.com/$CHANNEL/streams")
@@ -47,9 +52,12 @@ object YouTubeLive {
             if (obj.optString("contentType") == "LOCKUP_CONTENT_TYPE_VIDEO") {
                 val id = obj.optString("contentId")
                 if (id.isNotEmpty() && !games.containsKey(id)) {
-                    val title = liveTitleOf(obj)
-                    if (title != null && title.contains(WORLD_CUP_TAG, ignoreCase = true)) {
-                        games[id] = title
+                    val strings = collectStrings(obj)
+                    val liveNow = strings.any { it.trim().equals("AO VIVO", ignoreCase = true) } &&
+                        strings.none { it.contains("Em breve", ignoreCase = true) }
+                    val title = strings.firstOrNull { it.contains(WORLD_CUP_TAG, ignoreCase = true) }
+                    if (liveNow && title != null) {
+                        games[id] = title.removePrefix("AO VIVO").trimStart(':', ' ').trim()
                     }
                 }
             }
@@ -121,15 +129,11 @@ object YouTubeLive {
         }
     }
 
-    /** A live lockup's display title (its badge/label starts with "AO VIVO"). */
-    private fun liveTitleOf(lockup: JSONObject): String? {
-        var found: String? = null
-        walkStrings(lockup) { s ->
-            if (found == null && s.startsWith("AO VIVO")) {
-                found = s.removePrefix("AO VIVO").trimStart(':', ' ').trim()
-            }
-        }
-        return found
+    /** Every string in a JSON subtree (badges, titles, labels). */
+    private fun collectStrings(node: JSONObject): List<String> {
+        val out = ArrayList<String>()
+        walkStrings(node) { out.add(it) }
+        return out
     }
 
     /**
