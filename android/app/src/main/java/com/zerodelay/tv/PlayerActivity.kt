@@ -60,6 +60,8 @@ class PlayerActivity : Activity() {
     private var videoW = 0
     private var videoH = 0
     private var firstFrame = false
+    private var lastError: String? = null
+    private var errorCount = 0
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -107,7 +109,11 @@ class PlayerActivity : Activity() {
     private fun setupPlayer() {
         val p = ExoPlayer.Builder(this).build()
         p.addListener(object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) = onPlaybackError()
+            override fun onPlayerError(error: PlaybackException) {
+                errorCount++
+                lastError = "${error.errorCodeName}: ${error.message?.take(90)}"
+                onPlaybackError()
+            }
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 videoW = videoSize.width
                 videoH = videoSize.height
@@ -159,7 +165,7 @@ class PlayerActivity : Activity() {
     }
 
     private fun onPlaybackError() {
-        if (reExtracting) return
+        if (reExtracting || errorCount > 3) return // stop re-extracting so the error stays visible
         reExtracting = true
         info.text = getString(R.string.reconnecting)
         overlay.visibility = View.VISIBLE
@@ -219,7 +225,8 @@ class PlayerActivity : Activity() {
             else -> "?"
         }
         val diag = "estado=$state play=${p.isPlaying} vídeo=${videoW}x$videoH frame=${if (firstFrame) "sim" else "não"}"
-        info.text = getString(R.string.info_fmt, latency, buffered, speed) + "\n" + diag
+        val errLine = lastError?.let { "\nerr#$errorCount $it" } ?: ""
+        info.text = getString(R.string.info_fmt, latency, buffered, speed) + "\n" + diag + errLine
     }
 
     // --- Overlay / D-pad ----------------------------------------------------
