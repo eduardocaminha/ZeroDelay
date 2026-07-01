@@ -112,12 +112,16 @@ class PlayerActivity : Activity() {
         info.text = getString(R.string.loading)
         overlay.visibility = View.VISIBLE
         scope.launch {
-            val url = hlsUrl ?: withContext(Dispatchers.IO) {
-                runCatching { YouTubeLive.resolveHls(videoId) }.getOrNull()
-            }
-            if (url == null) {
-                info.text = getString(R.string.stream_error)
-                return@launch
+            val url = hlsUrl ?: run {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching { YouTubeLive.resolveHls(videoId) }.getOrNull()
+                }
+                if (result?.url == null) {
+                    info.text = getString(R.string.stream_error) +
+                        (result?.diagnostic?.let { "\n$it" } ?: "")
+                    return@launch
+                }
+                result.url
             }
             hlsUrl = url
             applyMode()
@@ -147,16 +151,17 @@ class PlayerActivity : Activity() {
         info.text = getString(R.string.reconnecting)
         overlay.visibility = View.VISIBLE
         scope.launch {
-            val url = withContext(Dispatchers.IO) {
+            val result = withContext(Dispatchers.IO) {
                 runCatching { YouTubeLive.resolveHls(videoId) }.getOrNull()
             }
             reExtracting = false
-            if (url != null) {
-                hlsUrl = url
+            if (result?.url != null) {
+                hlsUrl = result.url
                 applyMode()
                 scheduleOverlayHide()
             } else {
-                info.text = getString(R.string.stream_error)
+                info.text = getString(R.string.stream_error) +
+                    (result?.diagnostic?.let { "\n$it" } ?: "")
             }
         }
     }

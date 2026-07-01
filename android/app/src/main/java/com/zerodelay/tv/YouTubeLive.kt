@@ -9,6 +9,9 @@ import java.util.zip.GZIPInputStream
 /** One CazéTV live game. */
 data class Game(val videoId: String, val title: String)
 
+/** Result of an HLS resolve: the URL, or null plus a short reason for the UI. */
+data class HlsResult(val url: String?, val diagnostic: String? = null)
+
 /**
  * YouTube live extraction, yt-dlp style but via the watch page (the InnerTube
  * `player` endpoint is gated behind PoToken as of 2026; see android/spike/FINDINGS.md).
@@ -55,17 +58,37 @@ object YouTubeLive {
     }
 
     /**
-     * HLS master-playlist URL for a live video, or null. Retries because the
-     * watch page intermittently returns without streamingData (asks to reload).
+     * HLS master-playlist URL for a live video. Retries because the watch page
+     * intermittently returns without streamingData (asks to reload). On failure
+     * the result carries the YouTube playabilityStatus reason, so the UI can show
+     * WHY (bot check vs. reload vs. unavailable) instead of a generic error.
      */
-    fun resolveHls(videoId: String, attempts: Int = 4): String? {
-        val re = Regex("\"hlsManifestUrl\":\"(.*?)\"")
+    fun resolveHls(videoId: String, attempts: Int = 6): HlsResult {
+        val hlsRe = Regex("\"hlsManifestUrl\":\"(.*?)\"")
+        var lastDiag = "sem resposta"
         repeat(attempts) { i ->
-            val html = httpGet("https://www.youtube.com/watch?v=$videoId")
-            re.find(html)?.let { return unescape(it.groupValues[1]) }
-            if (i < attempts - 1) Thread.sleep(800)
+            val html = try {
+                httpGet("https://www.youtube.com/watch?v=$videoId")
+            } catch (e: Exception) {
+                lastDiag = "rede: ${e.message}"
+                if (i < attempts - 1) Thread.sleep(1000)
+                return@repeat
+            }
+            hlsRe.find(html)?.let { return HlsResult(unescape(it.groupValues[1])) }
+            lastDiag = playabilityDiag(html)
+            if (i < attempts - 1) Thread.sleep(1000)
         }
-        return null
+        return HlsResult(null, lastDiag)
+    }
+
+    /** Short "status=X · reason" pulled from the watch page's playabilityStatus. */
+    private fun playabilityDiag(html: String): String {
+        val status = Regex("\"playabilityStatus\":\\{\"status\":\"([^\"]+)\"")
+            .find(html)?.groupValues?.get(1) ?: "?"
+        val reason = Regex("\"reason\":\"([^\"]{1,90})\"").find(html)?.groupValues?.get(1)
+            ?: Regex("\"reason\":\\{\"simpleText\":\"([^\"]{1,90})\"").find(html)?.groupValues?.get(1)
+            ?: Regex("\"reason\":\\{\"runs\":\\[\\{\"text\":\"([^\"]{1,90})\"").find(html)?.groupValues?.get(1)
+        return "status=$status" + (reason?.let { " · $it" } ?: "")
     }
 
     /** The channel's primary current live videoId (fallback when listing fails). */
@@ -84,6 +107,7 @@ object YouTubeLive {
             readTimeout = 15000
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", UA)
+            setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9")
             // Consent cookie: without it the page is a consent interstitial with
             // no player response. hl/gl pin the locale so the "AO VIVO" badge is
