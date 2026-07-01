@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path
+        android:fillColor="#0B0B0F"
+        android:pathData="M0,0h320v180H0z" />
+    <!-- Lightning bolt (speed) -->
+    <path
+        android:fillColor="#E50914"
+        android:pathData="M74,34 L38,102 L66,102 L54,150 L98,78 L70,78 Z" />
+    <!-- Fast-forward chevrons -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M140,78 l26,12 l-26,12 z" />
+    <path
+        android:fillColor="#AAAAAA"
+        android:pathData="M180,78 l26,12 l-26,12 z" />
+    <path
+        android:fillColor="#555555"
+        android:pathData="M220,78 l26,12 l-26,12 z" />
+</vector>

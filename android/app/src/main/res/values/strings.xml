@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ZeroDelay TV</string>
+    <string name="title_live_now">Copa do Mundo · Ao vivo na CazéTV</string>
+    <string name="refresh">Atualizar</string>
+    <string name="loading">Carregando…</string>
+    <string name="no_lives">Nenhum jogo da Copa ao vivo agora. Toque em Atualizar.</string>
+    <string name="stream_error">Não foi possível carregar a transmissão.</string>
+    <string name="reconnecting">Reconectando…</string>
+    <string name="go_live">Ao vivo</string>
+    <string name="mode_prefix">Modo: %1$s</string>
+    <string name="info_fmt">Latência: %1$s  ·  Buffer: %2$.1fs  ·  Velocidade: %3$.2fx</string>
+
+    <string name="mode_off">Desligado</string>
+    <string name="mode_auto">Automático</string>
+    <string name="mode_suave">Suave</string>
+    <string name="mode_balanced">Equilibrado</string>
+    <string name="mode_aggressive">Próximo</string>
+    <string name="mode_min">Latência Mínima</string>
+</resources>
