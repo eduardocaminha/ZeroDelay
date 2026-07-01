@@ -1,83 +1,55 @@
 package com.zerodelay.tv
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
 import android.view.View
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import android.widget.Button
 import android.widget.TextView
-import androidx.annotation.OptIn
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.common.VideoSize
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.ui.PlayerView
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 /**
- * Plays one live with the hybrid catch-up engine:
- *  - ExoPlayer LiveConfiguration (per mode) does the smooth speed catch-up.
- *  - The ported ZeroDelay layer adds a skip-to-live watchdog + live indicators.
- *  - On playback error we re-extract the HLS URL (it can expire) and retry.
+ * Plays a live via the YouTube IFrame player inside a WebView. The embedded
+ * player is the real YouTube player, so it carries the PoToken that direct HLS
+ * extraction can't (googlevideo 403s naked segment requests; see
+ * android/spike/FINDINGS.md). The ZeroDelay catch-up runs as injected JS: it
+ * speeds up toward the mode's target latency and skips to the live edge.
+ *
+ * Decisive unknown this build answers: whether the IFrame API allows a playback
+ * rate > 1 on a LIVE stream. The overlay shows `avail=[...]` (the rates YouTube
+ * offers). If it is only [1], embed catch-up is impossible and we pivot to
+ * injecting into the full watch page instead.
  */
-@OptIn(UnstableApi::class)
 class PlayerActivity : Activity() {
 
     companion object {
         const val EXTRA_VIDEO_ID = "videoId"
         const val EXTRA_TITLE = "title"
         private const val OVERLAY_TIMEOUT_MS = 6000L
-        private const val TICK_MS = 500L
     }
 
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val ui = Handler(Looper.getMainLooper())
-
-    private var player: ExoPlayer? = null
-    private lateinit var playerView: PlayerView
+    private lateinit var web: WebView
     private lateinit var overlay: View
     private lateinit var info: TextView
     private lateinit var modeButton: Button
     private lateinit var liveButton: Button
 
     private var videoId: String = ""
-    private var hlsUrl: String? = null
     private var modeIndex = Modes.DEFAULT_INDEX
-    private var reExtracting = false
 
-    // Diagnostics surfaced in the overlay (temporary, to chase a black-screen).
-    private var videoW = 0
-    private var videoH = 0
-    private var firstFrame = false
-    private var lastError: String? = null
-    private var errorCount = 0
-
-    private val ticker = object : Runnable {
-        override fun run() {
-            updateInfo()
-            watchdogSkip()
-            ui.postDelayed(this, TICK_MS)
-        }
-    }
     private val hideOverlay = Runnable { overlay.visibility = View.GONE }
 
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_player)
-        playerView = findViewById(R.id.playerView)
+        web = findViewById(R.id.playerWeb)
         overlay = findViewById(R.id.overlay)
         info = findViewById(R.id.info)
         modeButton = findViewById(R.id.modeButton)
@@ -88,110 +60,52 @@ class PlayerActivity : Activity() {
         liveButton.setOnClickListener { goLive() }
         updateModeButton()
 
-        setupPlayer()
-        loadStream()
+        web.settings.javaScriptEnabled = true
+        web.settings.domStorageEnabled = true
+        web.settings.mediaPlaybackRequiresUserGesture = false
+        web.addJavascriptInterface(Bridge(), "Android")
+
+        info.text = getString(R.string.loading)
+        overlay.visibility = View.VISIBLE
+        // Base URL youtube.com so the IFrame API's postMessage origin checks pass.
+        web.loadDataWithBaseURL("https://www.youtube.com", buildHtml(videoId), "text/html", "utf-8", null)
     }
 
     override fun onStop() {
         super.onStop()
-        player?.pause()
+        web.onPause()
     }
 
     override fun onDestroy() {
-        ui.removeCallbacks(ticker)
         ui.removeCallbacks(hideOverlay)
-        scope.cancel()
-        player?.release()
-        player = null
+        web.destroy()
         super.onDestroy()
     }
 
-    // --- Playback -----------------------------------------------------------
+    // --- JS bridge ----------------------------------------------------------
 
-    private fun setupPlayer() {
-        // googlevideo 403s non-browser user agents, so fetch manifests/segments
-        // with the same browser UA used during extraction.
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(YouTubeLive.UA)
-            .setAllowCrossProtocolRedirects(true)
-        val p = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(httpFactory))
-            .build()
-        p.addListener(object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                errorCount++
-                lastError = "${error.errorCodeName}: ${error.message?.take(90)}"
-                onPlaybackError()
-            }
-            override fun onVideoSizeChanged(videoSize: VideoSize) {
-                videoW = videoSize.width
-                videoH = videoSize.height
-            }
-            override fun onRenderedFirstFrame() {
-                firstFrame = true
-            }
-        })
-        playerView.player = p
-        playerView.useController = false
-        player = p
-    }
-
-    private fun loadStream() {
-        info.text = getString(R.string.loading)
-        overlay.visibility = View.VISIBLE
-        scope.launch {
-            val url = hlsUrl ?: run {
-                val result = withContext(Dispatchers.IO) {
-                    runCatching { YouTubeLive.resolveHls(videoId) }.getOrNull()
-                }
-                if (result?.url == null) {
-                    info.text = getString(R.string.stream_error) +
-                        (result?.diagnostic?.let { "\n$it" } ?: "")
-                    return@launch
-                }
-                result.url
-            }
-            hlsUrl = url
-            applyMode()
-            ui.removeCallbacks(ticker)
-            ui.post(ticker)
-            scheduleOverlayHide()
+    inner class Bridge {
+        @JavascriptInterface
+        fun onStats(json: String) {
+            ui.post { showStats(json) }
         }
     }
 
-    private fun applyMode() {
-        val p = player ?: return
-        val url = hlsUrl ?: return
-        val mode = Modes.LIST[modeIndex]
-        val item = MediaItem.Builder()
-            .setUri(url)
-            .setMimeType(MimeTypes.APPLICATION_M3U8) // googlevideo URLs have no .m3u8 suffix
-            .apply { mode.liveConfig()?.let { setLiveConfiguration(it) } }
-            .build()
-        p.setMediaItem(item)
-        p.prepare()
-        p.playWhenReady = true
-    }
-
-    private fun onPlaybackError() {
-        if (reExtracting || errorCount > 3) return // stop re-extracting so the error stays visible
-        reExtracting = true
-        info.text = getString(R.string.reconnecting)
-        overlay.visibility = View.VISIBLE
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { YouTubeLive.resolveHls(videoId) }.getOrNull()
-            }
-            reExtracting = false
-            if (result?.url != null) {
-                hlsUrl = result.url
-                applyMode()
-                scheduleOverlayHide()
-            } else {
-                info.text = getString(R.string.stream_error) +
-                    (result?.diagnostic?.let { "\n$it" } ?: "")
-            }
+    private fun showStats(json: String) {
+        val s = runCatching { JSONObject(json) }.getOrNull() ?: return
+        val lat = s.optDouble("lat", Double.NaN)
+        val rate = s.optDouble("rate", 1.0)
+        val ps = s.optInt("ps", -99)
+        val avail = s.optString("avail", "?")
+        val err = s.optInt("err", 0)
+        val latStr = if (lat.isNaN()) "--" else String.format("%.1fs", lat)
+        val stateStr = when (ps) {
+            -1 -> "unstarted"; 0 -> "ended"; 1 -> "playing"; 2 -> "paused"
+            3 -> "buffering"; 5 -> "cued"; else -> "?"
         }
+        val line1 = "Latência: $latStr  ·  Velocidade: ${String.format("%.2f", rate)}x"
+        val line2 = "estado=$stateStr avail=$avail" + if (err != 0) " ERRO=$err" else ""
+        info.text = "$line1\n$line2"
     }
 
     // --- Modes / live -------------------------------------------------------
@@ -207,44 +121,21 @@ class PlayerActivity : Activity() {
         modeButton.text = getString(R.string.mode_prefix, getString(Modes.LIST[modeIndex].labelRes))
     }
 
+    private fun applyMode() {
+        val m = Modes.LIST[modeIndex]
+        val target = m.targetOffsetMs / 1000.0
+        val skipAt = m.skipThresholdMs / 1000.0
+        js("window.zd && window.zd.setMode($target, ${m.maxSpeed}, ${m.skip}, $skipAt)")
+    }
+
     private fun goLive() {
-        player?.seekToDefaultPosition()
+        js("window.zd && window.zd.goLive()")
         scheduleOverlayHide()
     }
 
-    private fun watchdogSkip() {
-        val p = player ?: return
-        val mode = Modes.LIST[modeIndex]
-        if (!mode.skip) return
-        val off = p.currentLiveOffset
-        if (off != C.TIME_UNSET && off > mode.skipThresholdMs) p.seekToDefaultPosition()
-    }
-
-    private fun updateInfo() {
-        val p = player ?: return
-        val off = p.currentLiveOffset
-        val latency = if (off == C.TIME_UNSET) "--" else String.format("%.1fs", off / 1000.0)
-        val buffered = p.totalBufferedDuration / 1000.0
-        val speed = p.playbackParameters.speed
-        val state = when (p.playbackState) {
-            Player.STATE_IDLE -> "idle"
-            Player.STATE_BUFFERING -> "buffering"
-            Player.STATE_READY -> "ready"
-            Player.STATE_ENDED -> "ended"
-            else -> "?"
-        }
-        val diag = "estado=$state play=${p.isPlaying} vídeo=${videoW}x$videoH frame=${if (firstFrame) "sim" else "não"}"
-        val errLine = lastError?.let { "\nerr#$errorCount $it" } ?: ""
-        info.text = getString(R.string.info_fmt, latency, buffered, speed) + "\n" + diag + errLine
-    }
+    private fun js(code: String) = web.evaluateJavascript(code, null)
 
     // --- Overlay / D-pad ----------------------------------------------------
-
-    private fun showOverlay() {
-        overlay.visibility = View.VISIBLE
-        modeButton.requestFocus()
-        scheduleOverlayHide()
-    }
 
     private fun scheduleOverlayHide() {
         ui.removeCallbacks(hideOverlay)
@@ -260,7 +151,9 @@ class PlayerActivity : Activity() {
                 KeyEvent.KEYCODE_DPAD_UP,
                 KeyEvent.KEYCODE_DPAD_DOWN -> {
                     if (overlay.visibility != View.VISIBLE) {
-                        showOverlay()
+                        overlay.visibility = View.VISIBLE
+                        modeButton.requestFocus()
+                        scheduleOverlayHide()
                         return true
                     }
                     scheduleOverlayHide()
@@ -275,4 +168,65 @@ class PlayerActivity : Activity() {
         }
         return super.dispatchKeyEvent(event)
     }
+
+    // --- Embedded page ------------------------------------------------------
+
+    // Default mode baked in matches Modes.DEFAULT_INDEX (Automático): target 6s,
+    // max rate 1.25, skip at 30s. Kotlin re-sends on mode change.
+    private fun buildHtml(vid: String): String = HTML_TEMPLATE.replace("__VID__", vid)
 }
+
+private const val HTML_TEMPLATE = """
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}</style>
+</head><body>
+<div id="p"></div>
+<script>
+var VIDEO_ID="__VID__";
+var player, ready=false;
+var mode={target:6, maxRate:1.25, skip:true, skipAt:30};
+var st={rate:1, cur:0, dur:0, lat:null, ps:-1, avail:"?", err:0};
+function onYouTubeIframeAPIReady(){
+  player=new YT.Player('p',{
+    videoId:VIDEO_ID,
+    playerVars:{autoplay:1, controls:0, rel:0, playsinline:1, modestbranding:1, fs:0},
+    events:{
+      onReady:function(){
+        ready=true;
+        try{player.playVideo();}catch(e){}
+        try{st.avail=JSON.stringify(player.getAvailablePlaybackRates());}catch(e){}
+        loop();
+      },
+      onStateChange:function(e){st.ps=e.data;},
+      onError:function(e){st.err=e.data;}
+    }
+  });
+}
+function loop(){
+  try{
+    st.cur=player.getCurrentTime();
+    st.dur=player.getDuration();
+    st.rate=player.getPlaybackRate();
+    st.lat=Math.max(0, st.dur-st.cur);
+    if(mode.skip && st.lat>mode.skipAt){
+      player.seekTo(st.dur, true);
+    } else if(st.lat > mode.target+1.5){
+      if(Math.abs(st.rate-mode.maxRate)>0.01) player.setPlaybackRate(mode.maxRate);
+    } else if(st.lat <= mode.target){
+      if(Math.abs(st.rate-1)>0.01) player.setPlaybackRate(1);
+    }
+  }catch(e){}
+  try{Android.onStats(JSON.stringify(st));}catch(e){}
+  setTimeout(loop, 500);
+}
+window.zd={
+  setMode:function(t,m,skip,skipAt){mode={target:t, maxRate:m, skip:skip, skipAt:skipAt};},
+  goLive:function(){try{player.seekTo(player.getDuration(), true);}catch(e){}}
+};
+var s=document.createElement('script');
+s.src="https://www.youtube.com/iframe_api";
+document.head.appendChild(s);
+</script>
+</body></html>
+"""

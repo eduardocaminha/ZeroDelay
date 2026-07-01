@@ -2,12 +2,31 @@
 
 Data: 2026-07-01. Objetivo: responder a única pergunta que decide a viabilidade do
 app Android (obter a URL do manifest HLS de uma live do YouTube sem API oficial e
-sem login). Resto do porte (ExoPlayer + controlador de catch-up) é baixo risco.
+sem login).
 
-## Resultado
+## CORREÇÃO (2026-07-01, depois do teste em aparelho): abordagem NÃO é viável
 
-Viável hoje pela página `/watch`, não pela API InnerTube. Testado ponta a ponta em
-4 lives reais, com validação até o nível de segmento de mídia.
+O manifest e as media playlists são servidos (HTTP 200), MAS os **segmentos de
+vídeo** (`videoplayback` no host `rr1---sn-...googlevideo.com`) retornam **HTTP 403
+para qualquer requisição** direta: testado com UA de browser, UA do Media3, sem UA,
+com Referer/Origin, IPv4 e IPv6, IP batendo com o `ip=` da URL, `sig` presente e
+`expire` no futuro. Confirmado universal em Lofi Girl, CazéTV e NASA (não é canal,
+geo nem DRM). `Server: gvs`, body vazio, sem motivo explícito.
+
+Causa: o YouTube (2026) exige um PoToken/SABR na **entrega de mídia**, não só no
+InnerTube. Serve o manifest, mas barra o download do vídeo sem o token que só o
+player real (com BotGuard) possui. É o mesmo muro que bloqueou o InnerTube, aplicado
+uma camada abaixo.
+
+O "Resultado" abaixo (validação só até a media playlist) estava INCOMPLETO: nunca
+baixou um segmento `.ts`, que é exatamente onde trava. Fica como lição de
+verificação: validar extração de mídia SEMPRE baixando/tocando um segmento real, não
+o manifest.
+
+## Resultado (INCOMPLETO: parou na media playlist, ver correção acima)
+
+Aparentava viável pela página `/watch`, não pela API InnerTube. Testado em 4 lives
+reais, mas a validação parou na media playlist (não baixou segmento de vídeo).
 
 | Live (canal) | videoId testado | HLS extraído | Master playlist | Segmentos de mídia |
 | --- | --- | --- | --- | --- |
